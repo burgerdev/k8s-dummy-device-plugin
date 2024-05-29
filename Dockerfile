@@ -1,8 +1,5 @@
 # Builder phase.
-FROM golang:1.10 AS builder
-ENV build_date 2018-04-12
-ENV GOPATH /usr/
-RUN mkdir -p /usr/src/
+FROM golang:1.22.3 AS builder
 ADD . /usr/src/k8s-dummy-device-plugin
 WORKDIR /usr/src/k8s-dummy-device-plugin
 # RUN go build dummy.go
