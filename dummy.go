@@ -4,19 +4,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/golang/glog"
-	"io/ioutil"
+	"log"
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-
-	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1beta1"
+	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
 // DummyDeviceManager manages our dummy devices
@@ -29,16 +26,17 @@ type DummyDeviceManager struct {
 
 // Init function for our dummy devices
 func (ddm *DummyDeviceManager) Init() error {
-	glog.Info("Initializing dummy device plugin...")
+	log.Println("Initializing dummy device plugin...")
 	return nil
 }
 
 // discoverDummyResources populates device list
 // TODO: We currently only do this once at init, need to change it to do monitoring
-//		 and health state update
+//
+//	and health state update
 func (ddm *DummyDeviceManager) discoverDummyResources() error {
-	glog.Info("Discovering dummy devices")
-	raw, err := ioutil.ReadFile("./dummyResources.json")
+	log.Println("Discovering dummy devices")
+	raw, err := os.ReadFile("./dummyResources.json")
 	if err != nil {
 		fmt.Println(err.Error())
 		return err
@@ -55,7 +53,7 @@ func (ddm *DummyDeviceManager) discoverDummyResources() error {
 		ddm.devices[dev["name"]] = &newdev
 	}
 
-	glog.Infof("Devices found: %v", ddm.devices)
+	log.Printf("Devices found: %v", ddm.devices)
 	return nil
 }
 
@@ -111,7 +109,7 @@ func (ddm *DummyDeviceManager) Stop() error {
 // TODO: Currently does nothing, need to implement
 func (ddm *DummyDeviceManager) healthcheck() error {
 	for {
-		glog.Info(ddm.devices)
+		log.Println(ddm.devices)
 		time.Sleep(60 * time.Second)
 	}
 }
@@ -130,10 +128,10 @@ func Register() error {
 		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
 			return net.DialTimeout("unix", addr, timeout)
 		}))
-	defer conn.Close()
 	if err != nil {
 		return fmt.Errorf("device-plugin: cannot connect to kubelet service: %v", err)
 	}
+	defer conn.Close()
 	client := pluginapi.NewRegistrationClient(conn)
 	reqt := &pluginapi.RegisterRequest{
 		Version: pluginapi.Version,
@@ -141,7 +139,7 @@ func Register() error {
 		// PATH = path.Join(DevicePluginPath, endpoint)
 		Endpoint: "dummy.sock",
 		// Schedulable resource name.
-		ResourceName: "nvidia.com/gpu",
+		ResourceName: "dummy-device-plugin.burgerdev.de/dev-zero",
 	}
 
 	_, err = client.Register(context.Background(), reqt)
@@ -153,55 +151,58 @@ func Register() error {
 
 // ListAndWatch lists devices and update that list according to the health status
 func (ddm *DummyDeviceManager) ListAndWatch(emtpy *pluginapi.Empty, stream pluginapi.DevicePlugin_ListAndWatchServer) error {
-	glog.Info("device-plugin: ListAndWatch start\n")
+	log.Println("device-plugin: ListAndWatch start")
 	resp := new(pluginapi.ListAndWatchResponse)
 	for _, dev := range ddm.devices {
-		glog.Info("dev ", dev)
+		log.Println("dev ", dev)
 		resp.Devices = append(resp.Devices, dev)
 	}
-	glog.Info("resp.Devices ", resp.Devices)
+	log.Println("resp.Devices ", resp.Devices)
 	if err := stream.Send(resp); err != nil {
-		glog.Errorf("Failed to send response to kubelet: %v", err)
+		log.Printf("Failed to send response to kubelet: %v", err)
 	}
 
-	for {
-		select {
-		case d := <-ddm.health:
-			d.Health = pluginapi.Unhealthy
-			resp := new(pluginapi.ListAndWatchResponse)
-			for _, dev := range ddm.devices {
-				glog.Info("dev ", dev)
-				resp.Devices = append(resp.Devices, dev)
-			}
-			glog.Info("resp.Devices ", resp.Devices)
-			if err := stream.Send(resp); err != nil {
-				glog.Errorf("Failed to send response to kubelet: %v", err)
-			}
+	for d := range ddm.health {
+		d.Health = pluginapi.Unhealthy
+		resp := new(pluginapi.ListAndWatchResponse)
+		for _, dev := range ddm.devices {
+			log.Println("dev ", dev)
+			resp.Devices = append(resp.Devices, dev)
+		}
+		log.Println("resp.Devices ", resp.Devices)
+		if err := stream.Send(resp); err != nil {
+			log.Printf("Failed to send response to kubelet: %v", err)
 		}
 	}
+	return nil
 }
 
 // Allocate devices
 func (ddm *DummyDeviceManager) Allocate(ctx context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
-	glog.Info("Allocate")
+	log.Println("Allocate")
 	responses := pluginapi.AllocateResponse{}
 	for _, req := range reqs.ContainerRequests {
 		for _, id := range req.DevicesIDs {
 			if _, ok := ddm.devices[id]; !ok {
-				glog.Errorf("Can't allocate interface %s", id)
+				log.Printf("Can't allocate interface %s", id)
 				return nil, fmt.Errorf("invalid allocation request: unknown device: %s", id)
 			}
 		}
-		glog.Info("Allocated interfaces ", req.DevicesIDs)
-		response := pluginapi.ContainerAllocateResponse{
-			Envs: map[string]string{"DUMMY_DEVICES": strings.Join(req.DevicesIDs, ",")},
+		log.Println("Allocated interfaces ", req.DevicesIDs)
+		response := pluginapi.ContainerAllocateResponse{}
+		for _, id := range req.DevicesIDs {
+			response.Devices = append(response.Devices, &pluginapi.DeviceSpec{
+				HostPath:      "/dev/zero",
+				ContainerPath: "/dev/" + id,
+				Permissions:   "r",
+			})
 		}
 		responses.ContainerResponses = append(responses.ContainerResponses, &response)
 	}
 	return &responses, nil
 }
 
-// GetDevicePluginOptions returns options to be communicated with Device Manager 
+// GetDevicePluginOptions returns options to be communicated with Device Manager
 func (ddm *DummyDeviceManager) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
 	return &pluginapi.DevicePluginOptions{}, nil
 }
@@ -213,21 +214,37 @@ func (ddm *DummyDeviceManager) PreStartContainer(context.Context, *pluginapi.Pre
 	return &pluginapi.PreStartContainerResponse{}, nil
 }
 
+func (ddm *DummyDeviceManager) GetPreferredAllocation(ctx context.Context, req *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
+	resp := &pluginapi.PreferredAllocationResponse{}
+	for _, creq := range req.ContainerRequests {
+		cresp := &pluginapi.ContainerPreferredAllocationResponse{}
+		cresp.DeviceIDs = creq.MustIncludeDeviceIDs
+		devices := creq.GetAvailableDeviceIDs()
+		for i := range int(creq.AllocationSize) - len(cresp.DeviceIDs) {
+			if i >= len(devices) {
+				break
+			}
+			cresp.DeviceIDs = append(cresp.DeviceIDs, devices[i])
+		}
+		resp.ContainerResponses = append(resp.ContainerResponses, cresp)
+	}
+	return resp, nil
+}
+
 func main() {
 	flag.Parse()
-	flag.Lookup("logtostderr").Value.Set("true")
 
 	// Create new dummy device manager
 	ddm := &DummyDeviceManager{
 		devices: make(map[string]*pluginapi.Device),
-		socket: pluginapi.DevicePluginPath + "dummy.sock",
-		health: make(chan *pluginapi.Device),
+		socket:  pluginapi.DevicePluginPath + "dummy.sock",
+		health:  make(chan *pluginapi.Device),
 	}
 
 	// Populate device list
 	err := ddm.discoverDummyResources()
 	if err != nil {
-		glog.Fatal(err)
+		log.Fatal(err)
 	}
 
 	// Respond to syscalls for termination
@@ -237,21 +254,18 @@ func main() {
 	// Start grpc server
 	err = ddm.Start()
 	if err != nil {
-		glog.Fatalf("Could not start device plugin: %v", err)
+		log.Fatalf("Could not start device plugin: %v", err)
 	}
-	glog.Infof("Starting to serve on %s", ddm.socket)
+	log.Printf("Starting to serve on %s", ddm.socket)
 
 	// Registers with Kubelet.
 	err = Register()
 	if err != nil {
-		glog.Fatal(err)
+		log.Fatal(err)
 	}
 	fmt.Printf("device-plugin registered\n")
 
-	select {
-	case s := <-sigs:
-		glog.Infof("Received signal \"%v\", shutting down.", s)
-		ddm.Stop()
-		return
-	}
+	s := <-sigs
+	log.Printf("Received signal \"%v\", shutting down.", s)
+	ddm.Stop()
 }
